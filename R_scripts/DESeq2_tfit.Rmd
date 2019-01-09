@@ -1,0 +1,577 @@
+---
+title: "DESeq2 Nascent Count Processing"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# First install and load packages
+
+```{r InstallPackages, echo = TRUE}
+##install packages
+source("https://bioconductor.org/biocLite.R")
+biocLite("DESeq2")
+install.packages("gplots")
+install.packages("ggplot2")
+install.packages("RColorBrewer")
+install.packages("calibrate")
+install.packages("wesanderson")
+install.packages("cowplot")
+install.packages("dyplr")
+
+##load in the libraries
+library(ggplot2)
+library(wesanderson)
+library(RColorBrewer)
+library(cowplot)
+library(DESeq2)
+library(calibrate)
+library(gplots)
+library(dplyr)
+
+```
+# Set working directory
+```{r project directory variables}
+
+workdir <- "/scratch/Users/magr0763/Gerber/GRO-seq/analysis/DESeq2/tfit/"
+
+```
+
+
+# Loading and formatting bed file count data from samples over annotated regions (e.g. bed file containing gene regions)
+
+```{r load_count_data}
+##load the bed file
+countdata <- read.delim("/scratch/Users/magr0763/Gerber/GRO-seq/analysis/counts/multibamcov/Gerber_counts.noTSS.tfit.bed", sep="\t", header=FALSE)
+
+##Remove three columns (chr, start, end)
+countdata <- countdata[-c(1:3)]
+
+##Check countdata
+head(countdata)
+
+# Convert column 1 to rownames
+
+rownames(countdata) <- countdata[,1]
+countdata <- countdata[-c(1)]
+
+countdata
+
+countdata <- dplyr::rename(countdata, Dex10=V5, Dex10_2=V6, DMSO10=V7, DMSO10_2=V8, DexTNFa10=V9, DexTNFa10_2=V10, TNFa10=V11, TNFa10_2=V12, Dex30=V13, Dex30_2=V14, DMSO30=V15, DMSO30_2=V16, DexTNFa30=V17, DexTNFa30_2=V18, TNFa30=V19, TNFa30_2=V20)
+
+countdata
+
+# Some datasets have more than one timepoint, which you may want to process separately
+
+count10 <- countdata[-c(9:16)]
+count30 <- countdata[-c(1:8)]
+
+##Convert to matrix for DESeq2 pipeline
+data10 <- as.matrix(count10)
+data30 <- as.matrix(count30)
+head(count10)
+head(count30)
+
+```
+
+# Import conditions table
+
+```{r import conditions}
+
+conditionstable <- read.csv("/scratch/Users/magr0763/Gerber/GRO-seq/analysis/counts/conditions_table_10min.csv", header=TRUE)
+
+conditionstable
+
+condition <- factor(c(rep("Dex", 2), rep("DMSO", 2), rep("Dex_TNFa", 2), rep("TNFa", 2)))
+
+condition
+
+```
+
+
+
+```{r Generate matrix, run DESeq2 pipeline}
+
+# Create a coldata frame and instantiate the DESeqDataSet. See ?DESeqDataSetFromMatrix
+coldata <- data.frame(row.names=colnames(data10), condition)
+dds <- DESeqDataSetFromMatrix(countData=data10, colData=coldata, design=~condition)
+dds
+
+# Run the DESeq pipeline
+dds <- DESeq(dds)
+
+#QC -- Check sizeFactors, should be close to 1 (ideally) -- largely affected by depth (read counts)
+sizeFactors(dds)
+
+#Can run option "iterate" which adjusts calculations assuming an ideal size facotor of 1
+#dds <- estimateSizeFactors(dds, type= "iterate")
+
+#Run the following to remove rows with number of reads < 100
+#dds <- dds[ rowSums(counts(dds)) > 50, ] 
+
+```
+
+```{r Running QC on DESeq2 data}
+# Plot dispersions
+png(paste(workdir, "qc-dispersions.png", step=""), 1000, 1000, pointsize=20)
+plotDispEsts(dds, main="Dispersion plot")
+dev.off()
+
+# Regularized log transformation for clustering/heatmaps, etc
+rld <- rlogTransformation(dds)
+head(assay(rld))
+hist(assay(rld), col="skyblue", border="slateblue", main="Gerber Histogram")
+
+#Examine the effect of log transformation (QC check)
+
+plot( log2( 1 + counts(dds, normalized=TRUE)[ , 3:4] ),
+      col=rgb(0,0,0,.2), pch=16, cex=0.3 )
+plot( assay(rld)[ , 3:4],
+      col=rgb(0,0,0,.2), pch=16, cex=0.3 )
+
+# Colors for plots below
+## Ugly:
+## (mycols <- 1:length(unique(condition)))
+## Use RColorBrewer, better
+library(RColorBrewer)
+(mycols <- brewer.pal(8, "Dark2")[1:length(unique(condition))])
+
+# Sample distance heatmap
+sampleDists <- dist( t( assay(rld) ) )
+library(gplots)
+png(paste(workdir,"qc-heatmap-samples2.png"), w=1000, h=1000, pointsize=20)
+heatmap.2(as.matrix(sampleDists), key=F, trace="none",
+          col=colorpanel(100, "black", "white"),
+          ColSideColors=mycols[condition], RowSideColors=mycols[condition],
+          margin=c(10, 10), main="Sample Distance Matrix")
+dev.off()
+
+# Principal components analysis
+## Could do with built-in DESeq2 function:
+## DESeq2::plotPCA(rld, intgroup="condition")
+## I like mine better:
+rld_pca <- function (rld, intgroup = "condition", ntop = 500, colors=NULL, legendpos="bottomleft", main="PCA Biplot", textcx=1, ...) {
+  require(genefilter)
+  require(calibrate)
+  require(RColorBrewer)
+  rv = rowVars(assay(rld))
+  select = order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pca = prcomp(t(assay(rld)[select, ]))
+  fac = factor(apply(as.data.frame(colData(rld)[, intgroup, drop = FALSE]), 1, paste, collapse = " : "))
+  if (is.null(colors)) {
+    if (nlevels(fac) >= 3) {
+      colors = brewer.pal(nlevels(fac), "Paired")
+    }   else {
+      colors = c("black", "red")
+    }
+  }
+  pc1var <- round(summary(pca)$importance[2,1]*100, digits=1)
+  pc2var <- round(summary(pca)$importance[2,2]*100, digits=1)
+  pc1lab <- paste0("PC1 (",as.character(pc1var),"%)")
+  pc2lab <- paste0("PC1 (",as.character(pc2var),"%)")
+  plot(PC2~PC1, data=as.data.frame(pca$x), bg=colors[fac], pch=21, xlab=pc1lab, ylab=pc2lab, main=main, ...)
+  with(as.data.frame(pca$x), textxy(PC1, PC2, labs=rownames(as.data.frame(pca$x)), cex=textcx))
+  legend(legendpos, legend=levels(fac), col=colors, pch=20) }
+
+  # rldyplot(PC2 ~ PC1, groups = fac, data = as.data.frame(pca$rld),
+  #          pch = 16, cerld = 2, aspect = "iso", col = colours, main = draw.key(key = list(rect = list(col = colours),
+  #          terldt = list(levels(fac)), rep = FALSE)))
+
+png(paste(workdir, "qc-pca2.png"), 1000, 1000, pointsize=20)
+rld_pca(rld, colors=mycols, intgroup="condition", xlim=c(-75, 35))
+dev.off()
+
+```
+
+# Now that we have run the main DESeq2 function, it's time to compare results for differential expression/transcription between treatment types
+
+```{r First, set our variables for DE analysis}
+
+outdir <- "/scratch/Users/magr0763/Gerber/GRO-seq/analysis/DESeq2/tfit/10min/D10TD10/"
+condx <- "Dex_TNFa"
+condy <- "Dex"
+
+```
+
+# Using the head() command you can view the first 6 rows of the dataframe.
+
+```{r Testing differential expression/transcription between treaments}
+
+# Get differential expression results, specify which conditions to contrast (max=2)
+res <- results(dds, contrast = c("condition", condx, condy))
+table(res$padj<0.05)
+
+## Order by adjusted p-value
+res <- res[order(res$padj), ]
+
+## Merge with normalized count data
+resdata <- merge(as.data.frame(res), as.data.frame(counts(dds, normalized=TRUE)), by="row.names", sort=FALSE)
+names(resdata)[1] <- "Gene"
+head(resdata)
+
+
+
+```
+
+
+# Now we can save significantly regulated genes, upregulated and downregulated, with a set padj cutoff value
+
+```{r exploreData}
+
+### Write results
+write.csv(resdata, paste0(outdir, file="diffexpr-results_DESeq2.csv"))
+write.table(resdata, paste0(outdir, file="diffexpr-results_DESeq2.txt"), append = FALSE, sep = "\t" )
+
+## Separate upregulated and downregulated genes w/padj cutoff -- first reorder by significance
+
+res <- na.omit(res)
+resSig <- res[ res$padj < .05, ]
+
+## Upregulated genes 
+
+up <- subset(resSig, log2FoldChange > 0)
+up <- merge(as.data.frame(up), as.data.frame(counts(dds,normalized=TRUE)), by="row.names", sort=FALSE)
+
+up
+
+write.table(up[order(up$log2FoldChange, decreasing=TRUE),],
+            paste0(outdir, "UpRegulated.txt"))
+write.csv(up[order(up$log2FoldChange, decreasing=TRUE),],
+            paste0(outdir, "UpRegulated.csv"))
+
+## Downregulated genes
+
+down <- subset(resSig, log2FoldChange < 0)
+down <- merge(as.data.frame(down), as.data.frame(counts(dds,normalized=TRUE)), by="row.names", sort=FALSE)
+
+down
+
+write.table(down[order(down$log2FoldChange, decreasing=TRUE),],
+            paste0(outdir, "DownRegulated.txt"))
+write.csv(down[order(down$log2FoldChange, decreasing=TRUE),],
+            paste0(outdir, "DownRegulated.csv"))
+
+
+## Examine plot of p-values
+hist(res$pvalue, breaks=50, col="grey")
+
+## Check independent filtering
+metadata(res)$filterThreshold
+
+```
+ 
+ We can see that we have columns:
+ 
+ * "X" representing gene names 
+ * "baseMean" representing average normalized counts for gene
+ * "log2FoldChange" representing the log2 fold change from treated versus control
+ * "lfcSE" representing the log fold standard error
+ * "stat" represents the wald-statistic
+ * "pvalue" is the p-value calculated for each gene
+ * "padj" is the adjusted p-value
+ 
+
+# Plotting in R
+
+ggplot2 is a graphing package in R, that allows for various representation of your data in graphs.
+
+## MA Scatter Plot 
+
+The MA plot is a represation of all the gene data such that the mean expression is on teh x-axis and the log2 fold change is the y-axis.
+
+
+
+The figure before we are using ggplot(df, aes(x-axis, y-axis)) + geom_point() to create a scatter plot of our expression data. 
+
+```{r basicGG, echo = TRUE}
+
+de_data <- as.data.frame(res)
+ggplot(de_data, aes(log(baseMean), log2FoldChange)) + 
+  geom_point() 
+
+```
+
+In this section, we are now adding a background theme using the theme_classic() command to make a plain white background. 
+We are also adding axis labels with the ylab() and xlab() commands. 
+The other addition is a title with the ggtitle() command. To center the graph title, a theme(plot.title = element_text(hjust = 0.5)) is specified.   
+
+```{r basicGG2, echo = TRUE}
+
+
+ggplot(de_data, aes(log(baseMean,2), log2FoldChange)) + 
+  geom_point() + #plot a scatter plot
+  theme_classic() + #use the classic theme template 
+  xlab(expression(paste('log',''[2],' Average Normalized Counts'))) + #label the x-axis
+  ylab(expression(paste('log',''[2],' Fold Change'))) + #label the y-axis
+  ggtitle("MA plot for Dex vs. Control") + #to add title
+  theme(plot.title = element_text(hjust = 0.5)) #to center title
+
+```
+
+This section, we are adding a horizontal dotted red line at 0 in order to demarcate up-regulated (above 0 line) and down-regulated (below 0 line) genes.
+We are using the geom_hline() command to ahd a horizontal line. If one want to add a vertical line geon_vline() would be used.
+
+```{r basicGG3, echo = TRUE}
+
+ggplot(de_data, aes(log(baseMean,2), log2FoldChange)) + 
+  geom_point() + #plot a scatter plot
+  theme_classic() + #use the classic theme template 
+  xlab(expression(paste('log',''[2],' Average Normalized Counts'))) + #label the x-axis
+  ylab(expression(paste('log',''[2],' Fold Change'))) + #label the y-axis
+  ggtitle("MA plot for Dex vs. Control") + #to add title
+  theme(plot.title = element_text(hjust = 0.5)) + #to center title
+  geom_hline(aes(yintercept=0), colour="red", linetype="dashed") #plot a horizontal line
+
+```
+
+## Filtering dataframe
+
+In this section we are going to filter genes that we may be interested in highlighting in our plots.
+
+
+The code below will filter genes with an adjusted p-value below 0.05 (This is a cut-off most researchers as a significance cut-off).
+
+It will also filter genes based on log2foldchange, which may or may not be relevant but can be used in the volcano plots
+
+The dim() fuction gives the dimension of the dataframe.  
+
+
+```{r filterFC, echo = TRUE}
+
+signifGenes <- subset(de_data,  padj <= 0.05)
+dim(signifGenes)
+
+foldchange <- subset(de_data, log2FoldChange >= 2 | log2FoldChange <= -2)
+dim(foldchange)
+
+```
+
+
+If we want to filter a row of our gene of interest, we can use the df[row, colum] format as below.
+In the code below, we want a dataframe with gene of intereset "TP53" in the rownames. 
+
+```{r getGene, echo = TRUE}
+mfg <- de_data[rownames(de_data) == "bidir_58540",]
+print(mfg)
+```
+
+If we want to filter multiple rows of genes we can specify the rows as follows 
+
+```{r example1, eval = FALSE, echo=TRUE}
+mygenes <- de_data[rownames(de_data) == c("bidir_58540","bidir_38885"),]
+mygenes
+```
+
+
+Below, we are adding a point for the gene we have filtered (we can use the same command for multiple filtered genes).
+
+```{r basicGG4, echo = TRUE}
+
+ggplot(de_data, aes(log(baseMean,2), log2FoldChange)) + 
+  geom_point(color="gray20", alpha = 0.75) + ##change opacity of points
+  theme_classic() + ##use the classic theme template 
+  xlab(expression(paste('log',''[2],' Average Normalized Counts'))) + #label the x-axis
+  ylab(expression(paste('log',''[2],' Fold Change'))) + #label the y-axis
+  ggtitle("MA plot for Treatment vs. Control") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5)) + ##to center title
+  geom_hline(aes(yintercept=0), colour="red", linetype="dashed") + ##plot a horizontal line
+  geom_point(data=mygenes, aes(log(baseMean,2), log2FoldChange), color="darkblue",size=3) ##add point for gene of interest
+
+```
+
+In the code chunk below, we colouring all the significant genes we filtered above as red.
+We are also labeling our gene of interest using the geom_text command.
+
+```{r basicGG5, echo = TRUE}
+
+ggplot(de_data, aes(log(baseMean,2), log2FoldChange)) + 
+  geom_point(color="gray20", alpha = 0.5) + ##change opacity of points
+  theme_classic() + ##use the classic theme template 
+  xlab(expression(paste('log',''[2],' Average Normalized Counts'))) + #label the x-axis
+  ylab(expression(paste('log',''[2],' Fold Change'))) + #label the y-axis
+  ggtitle("MA plot for Treatment vs. Control") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5)) + ##to center title
+  geom_hline(aes(yintercept=0), colour="red", linetype="dashed") + ##plot a horizontal line
+  geom_point(data=signifGenes,aes(log(baseMean,2), log2FoldChange), color="red",size=1, alpha=0.75) +
+  geom_point(data=mfg, aes(log(baseMean,2), log2FoldChange), color="darkblue",size=2.5) +
+  geom_text(data=mfg, aes(log(baseMean,2), log2FoldChange, label = rownames(mfg)),hjust = 0, nudge_x = 0.09) ##label gene
+
+```
+
+```{r finalMA, echo = TRUE}
+
+ggplot(de_data, aes(log(baseMean,2), log2FoldChange)) + 
+  geom_point(color="gray20", alpha = 0.5) + ##change opacity of points
+  theme_classic() + ##use the classic theme template 
+  xlab(expression(paste('log',''[2],' Average Normalized Counts'))) + #label the x-axis
+  ylab(expression(paste('log',''[2],' Fold Change'))) + #label the y-axis
+  ggtitle("MA plot for Dex + TNFa vs. Dex") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5),
+        title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 12,face = "bold"),
+        axis.text = element_text(size = 16)) + ##to center title
+  geom_hline(aes(yintercept=0), color="blue", linetype="dashed") + ##plot a horizontal line
+  geom_point(data=signifGenes,aes(log(baseMean,2), log2FoldChange), color="red",size=1, alpha=0.75) +
+  geom_point(data=mfg, aes(log(baseMean,2), log2FoldChange), color="darkblue",size=2.5) +
+  geom_text(data=mfg, aes(log(baseMean,2), log2FoldChange, label = rownames(mfg)),hjust = 0, nudge_x = 0.09) ##label gene
+
+ggsave("MA_plot.png", plot = last_plot(), path = outdir,
+  scale = 1, width = NA, height = NA, units = c("in", "cm", "mm"),
+  dpi = 300, limitsize = TRUE)
+
+```
+
+## Volcano Scatter Plot
+
+The volcano scatter plot is a representation of all the genes with the x-axis as the log 2 fold change and the y-axis as the -log10 of the adjusted p-value. 
+
+To plot the volcano plot, we will use the same command as the MA plot ie. geom_point() but change our x-axis and y-axis. 
+
+```{r, volcano1, echo = TRUE}
+
+ggplot(de_data, aes(log2FoldChange, -log(padj))) + 
+  geom_point()
+
+
+```
+
+
+Below we are adding plot tiltle, x-axis and y-axis. 
+
+```{r volcano2, echo = TRUE}
+ggplot(de_data, aes(log2FoldChange, -log(padj))) + 
+  geom_point() +
+  theme_classic() + ##use the classic theme template 
+  xlab(expression(paste('log',''[2],' Fold Change'))) + #label the x-axis
+  ylab(expression(paste('-log',''[10],' Adjusted p-value'))) + #label the y-axis
+  ggtitle("Volcano plot for Treatment vs. Control") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5)) ##to center title
+
+
+```
+
+
+In this code chuck we are adding points for the data that we filtered earlier. 
+
+```{r volcano3, echo = TRUE}
+ggplot(de_data, aes(log2FoldChange, -log(padj))) + 
+  geom_point() +
+  theme_classic() + ##use the classic theme template 
+  xlab(expression(paste('log',''[2],' Fold Change'))) + #label the x-axis
+  ylab(expression(paste('-log',''[10],' Adjusted p-value'))) + #label the y-axis
+  ggtitle("Volcano plot for Treatment vs. Control") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5)) + ##to center title
+  geom_point(data=signifGenes,aes(log2FoldChange, -log(padj)), color="red",size=1.5, alpha=0.5) +
+  geom_point(data=mfg, aes(log2FoldChange, -log(padj)), color="darkblue",size=3) ##add point for gene of interest
+
+
+```
+
+
+This last step we are adding a label for our gene of interest. 
+
+```{r volcano_FINAL, echo = TRUE}
+
+ggplot(de_data, aes(log2FoldChange, -log(padj))) + 
+  geom_point() +
+  theme_classic() + ##use the classic theme template 
+ xlab(expression(paste('log',''[2],' Fold Change'))) + #label the x-axis
+  ylab(expression(paste('-log',''[10],' Adjusted p-value'))) + #label the y-axis
+  ggtitle("Volcano plot for Dex + TNFa vs. Dex") + ##to add title
+  theme(plot.title = element_text(hjust = 0.5)) + ##to center title
+  geom_point(data=signifGenes,aes(log2FoldChange, -log(padj)), color="red",size=1.5, alpha=0.5) +
+  geom_point(data=foldchange,aes(log2FoldChange, -log(padj)), color="orange",size=1.5, alpha=0.25) +
+  geom_point(data=mfg, aes(log2FoldChange, -log(padj)), color="darkblue",size=3) + ##add point for gene of interest
+  geom_text(data=mfg, aes(log2FoldChange, -log(padj), label = rownames(mfg)),hjust = 0, nudge_x = 0.15,angle=0) ##label gene
+
+ggsave("volcano.png", plot = last_plot(), path = outdir,
+  scale = 1, width = NA, height = NA, units = c("in", "cm", "mm"),
+  dpi = 300, limitsize = TRUE)
+
+```
+
+
+
+# Plotting bargraphs for gene X across samples
+
+First, to compare samples we need normalized reads. The function below calculates CPMs for all genes.
+
+```{r getCPMs, echo = TRUE}
+
+
+libs <-colSums(countdata) ## calculate library size
+
+##the function below gets us normalized counts as CPMs
+cpm.df <- matrix(0, nrow=nrow(countdata), ncol=ncol(countdata))
+for (i in 1:nrow(countdata)){
+  for (j in 1:ncol(countdata)){
+      cpm.df[i,j] <- (countdata[i,j]/libs[j])*1000000
+  }
+}
+
+rownames(cpm.df) <- rownames(countdata) 
+colnames(cpm.df) <- colnames(countdata)
+
+```
+
+## Filtering genes for plotting
+
+```{r plotBar, echo = TRUE}
+
+bidir_12446 <- cpm.df[rownames(cpm.df) == c("bidir_12446"),]
+
+bidir_12446t <- as.data.frame(bidir_12446)
+
+bidir_12446t$sample <- rownames(bidir_12446t)
+bidir_12446t$Treatment <- factor(c(rep("Dex", 2), rep("DMSO", 2), rep("Dex_TNFa", 2), rep("TNFa", 2), rep("Dex", 2), rep("DMSO", 2), rep("Dex_TNFa", 2), rep("TNFa", 2)))
+
+
+ggplot(bidir_12446t, aes(sample, bidir_12446, fill = Treatment)) + geom_bar(stat= 'identity') +
+  theme_classic() +
+  ggtitle("bidir_12446 Expression in Samples") +
+  xlab(" ") +
+  ylab("Counts Per Million") + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 12,face = "bold"),
+        axis.text = element_text(size = 12)) +
+  scale_fill_manual(values = wes_palette("Royal1"))
+
+ggsave("bidir_58540bar.png", plot = last_plot(), path = workdir,
+  scale = 1, width = NA, height = NA, units = c("in", "cm", "mm"),
+  dpi = 300, limitsize = TRUE)
+
+
+```
+
+```{r Other plot options}
+
+## Plot with more detail:
+maplot <- function (res, thresh=0.05, labelsig=TRUE, textcx=1, ...) {
+  with(res, plot(baseMean, log2FoldChange, pch=20, cex=.5, log="x", ...))
+  with(subset(res, padj<thresh), points(baseMean, log2FoldChange, col="red", pch=20, cex=1.5))
+}
+png(paste0(outdir, "diffexpr-maplot.png"), 1500, 1000, pointsize=20)
+maplot(resdata, main="MA Plot")
+dev.off()
+
+## Volcano plot with "significant" genes labeled
+volcanoplot <- function (res, lfcthresh=2, sigthresh=0.05, main="Volcano Plot", legendpos="bottomright", labelsig=TRUE, textcx=1, ...) {
+  with(res, plot(log2FoldChange, -log10(pvalue), pch=20, main=main, ...))
+  with(subset(res, padj<sigthresh ), points(log2FoldChange, -log10(pvalue), pch=20, col="red", ...))
+  with(subset(res, abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue), pch=20, col="orange", ...))
+  with(subset(res, padj<sigthresh & abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue), pch=20, col="green", ...))
+  legend(legendpos, xjust=1, yjust=1, legend=c(paste("FDR<",sigthresh,sep=""), paste("|LogFC|>",lfcthresh,sep=""), "both"), pch=20, col=c("red","orange","green"))
+}
+png(paste0(outdir, "diffexpr-volcanoplot.png"), 1200, 1000, pointsize=20)
+volcanoplot(resdata, lfcthresh=1, sigthresh=0.05, textcx=.8, xlim=c(-2.3, 2))
+dev.off()
+
+```
+
+

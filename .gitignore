@@ -1,0 +1,5 @@
+*.tar.gz
+tfit/
+DESeq2/
+fstitch/
+ChIP_DAStk/
